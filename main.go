@@ -25,14 +25,13 @@ import (
 	"unsafe"
 
 	"github.com/go-ole/go-ole"
-	"github.com/go-ole/go-ole/oleutil"
 	"github.com/moutend/go-wca/pkg/wca"
 	"golang.org/x/sys/windows"
 	"golang.org/x/sys/windows/registry"
 )
 
 const appName = "Yeti Mute Talker"
-const appVersion = "1.0.0"
+const appVersion = "1.1.0"
 
 // ---------------------------------------------------------------------------
 // Settings (stored in %APPDATA%\YetiMuteTalker\settings.ini)
@@ -43,6 +42,9 @@ type Settings struct {
 	MutedText   string
 	LiveText    string
 	SpeechRate  int
+	SpeechMode  string // "auto" or "windows"
+	VoiceEngine string // "sapi" or "onecore"
+	VoiceName   string
 	Beeps       bool
 	SilenceMs   int
 	LiveChunks  int     // how many 200 ms stretches in a row must have sound to count as live
@@ -55,6 +57,8 @@ func defaultSettings() Settings {
 		MutedText:   "Microphone muted",
 		LiveText:    "Microphone live",
 		SpeechRate:  2,
+		SpeechMode:  modeAuto,
+		VoiceEngine: "sapi",
 		Beeps:       true,
 		SilenceMs:   400,
 		LiveChunks:  3,
@@ -95,6 +99,20 @@ func loadSettings() Settings {
 			if v != "" {
 				s.LiveText = v
 			}
+		case "speak_with":
+			if strings.EqualFold(v, modeWindows) {
+				s.SpeechMode = modeWindows
+			} else {
+				s.SpeechMode = modeAuto
+			}
+		case "voice_engine":
+			if strings.EqualFold(v, "onecore") {
+				s.VoiceEngine = "onecore"
+			} else {
+				s.VoiceEngine = "sapi"
+			}
+		case "voice":
+			s.VoiceName = v
 		case "speech_rate":
 			if n, err := strconv.Atoi(v); err == nil && n >= -10 && n <= 10 {
 				s.SpeechRate = n
@@ -133,7 +151,18 @@ device=%s
 muted_text=%s
 live_text=%s
 
-; Speech speed, from -10 (slow) to 10 (fast)
+; Where to speak: auto (through NVDA or JAWS when running, otherwise the
+; Windows voice) or windows (always the Windows voice)
+speak_with=%s
+
+; Windows voice to use: engine is sapi or onecore, voice is the voice's name
+; (leave empty for the Windows default voice). Easiest to change from the
+; tray menu.
+voice_engine=%s
+voice=%s
+
+; Speed of the Windows voice, from -10 (slow) to 10 (fast).
+; Screen readers use their own speed.
 speech_rate=%d
 
 ; Play beeps before speaking: true or false
@@ -149,7 +178,7 @@ live_chunks=%d
 
 ; Set by the setup. Delete this line to run the setup again.
 threshold=%s
-`, s.DeviceMatch, s.MutedText, s.LiveText, s.SpeechRate, s.Beeps, s.SilenceMs, s.LiveChunks, th)
+`, s.DeviceMatch, s.MutedText, s.LiveText, s.SpeechMode, s.VoiceEngine, s.VoiceName, s.SpeechRate, s.Beeps, s.SilenceMs, s.LiveChunks, th)
 	text = strings.ReplaceAll(text, "\n", "\r\n")
 	if err := os.WriteFile(settingsPath(), []byte(text), 0644); err != nil {
 		logf("Could not save settings: %v", err)
@@ -424,45 +453,8 @@ func (m *Mic) SoundInEveryChunk(threshold float64, n int) bool {
 }
 
 // ---------------------------------------------------------------------------
-// Speech (Windows SAPI voice) and beeps
+// Beeps (speech is in speech.go)
 // ---------------------------------------------------------------------------
-
-var voice *ole.IDispatch
-
-func initVoice(rate int) {
-	unk, err := oleutil.CreateObject("SAPI.SpVoice")
-	if err != nil {
-		logf("Speech not available: %v", err)
-		return
-	}
-	voice, err = unk.QueryInterface(ole.IID_IDispatch)
-	unk.Release()
-	if err != nil {
-		logf("Speech not available: %v", err)
-		voice = nil
-		return
-	}
-	oleutil.PutProperty(voice, "Rate", rate)
-}
-
-// say speaks text without waiting, cutting off anything still being said.
-func say(text string) {
-	if voice == nil {
-		return
-	}
-	oleutil.CallMethod(voice, "Speak", text, 3) // async + purge
-}
-
-func speechDone() bool {
-	if voice == nil {
-		return true
-	}
-	r, err := oleutil.CallMethod(voice, "WaitUntilDone", 0)
-	if err != nil {
-		return true
-	}
-	return r.Value() == true
-}
 
 var (
 	kernel32 = windows.NewLazySystemDLL("kernel32.dll")
@@ -847,6 +839,7 @@ const (
 
 	mfString    = 0x0
 	mfSeparator = 0x800
+	mfPopup     = 0x10
 	mfChecked   = 0x8
 	tpmReturn   = 0x0100
 	tpmRight    = 0x0008
@@ -857,13 +850,18 @@ const (
 	modShift   = 0x4
 	modNoRep   = 0x4000
 
-	cmdStatus  = 1
-	cmdLevel   = 2
-	cmdSetup   = 3
-	cmdBeeps   = 4
-	cmdStartup = 5
-	cmdFolder  = 6
-	cmdExit    = 7
+	cmdStatus      = 1
+	cmdLevel       = 2
+	cmdSetup       = 3
+	cmdBeeps       = 4
+	cmdStartup     = 5
+	cmdFolder      = 6
+	cmdExit        = 7
+	cmdModeAuto    = 20
+	cmdModeWindows = 21
+	cmdTestVoice   = 22
+	cmdVoiceBase   = 100 // + index into the voice list
+	cmdRateBase    = 300 // + index into speedChoices
 
 	className = "YetiMuteTalkerWindow"
 )
@@ -975,16 +973,53 @@ func removeTray() {
 
 var menuClosedAt time.Time
 
+var speedChoices = []struct {
+	label string
+	rate  int
+}{
+	{"Slow", -4}, {"A little slow", 0}, {"Normal", 2}, {"Fast", 5}, {"Very fast", 8},
+}
+
+var menuVoices []VoiceChoice
+
+func addItem(menu uintptr, id int, text string, checked bool) {
+	flags := uintptr(mfString)
+	if checked {
+		flags |= mfChecked
+	}
+	pAppendMenu.Call(menu, flags, uintptr(id), uintptr(unsafe.Pointer(u16(text))))
+}
+
+func addSubmenu(menu, sub uintptr, text string) {
+	pAppendMenu.Call(menu, mfPopup|mfString, sub, uintptr(unsafe.Pointer(u16(text))))
+}
+
 func showMenu(x, y int32) {
 	menu, _, _ := pCreatePopupMenu.Call()
-	add := func(id int, text string, checked bool) {
-		flags := uintptr(mfString)
-		if checked {
-			flags |= mfChecked
-		}
-		pAppendMenu.Call(menu, flags, uintptr(id), uintptr(unsafe.Pointer(u16(text))))
-	}
+	add := func(id int, text string, checked bool) { addItem(menu, id, text, checked) }
 	sep := func() { pAppendMenu.Call(menu, mfSeparator, 0, 0) }
+
+	// Speak with
+	speakMenu, _, _ := pCreatePopupMenu.Call()
+	addItem(speakMenu, cmdModeAuto, "Screen reader when running (NVDA or JAWS), otherwise Windows voice", app.settings.SpeechMode != modeWindows)
+	addItem(speakMenu, cmdModeWindows, "Always the Windows voice", app.settings.SpeechMode == modeWindows)
+
+	// Windows voice
+	voiceMenu, _, _ := pCreatePopupMenu.Call()
+	menuVoices = speaker.voiceChoices()
+	addItem(voiceMenu, cmdVoiceBase+len(menuVoices), "Windows default voice", app.settings.VoiceName == "")
+	for i, v := range menuVoices {
+		cur := app.settings.VoiceName != "" && app.settings.VoiceEngine == v.Engine && strings.EqualFold(app.settings.VoiceName, v.Name)
+		addItem(voiceMenu, cmdVoiceBase+i, v.Label, cur)
+	}
+	pAppendMenu.Call(voiceMenu, mfSeparator, 0, 0)
+	addItem(voiceMenu, cmdTestVoice, "Test the Windows voice", false)
+
+	// Speed
+	rateMenu, _, _ := pCreatePopupMenu.Call()
+	for i, c := range speedChoices {
+		addItem(rateMenu, cmdRateBase+i, c.label, app.settings.SpeechRate == c.rate)
+	}
 
 	status := "Say microphone status"
 	if app.last == stateMuted || app.last == stateLive {
@@ -994,6 +1029,9 @@ func showMenu(x, y int32) {
 	add(cmdLevel, "Say sound level\tCtrl+Alt+L", false)
 	add(cmdSetup, "Run setup again\tCtrl+Alt+C", false)
 	sep()
+	addSubmenu(menu, speakMenu, "Speak with")
+	addSubmenu(menu, voiceMenu, "Windows voice")
+	addSubmenu(menu, rateMenu, "Windows voice speed")
 	add(cmdBeeps, "Play beeps", app.settings.Beeps)
 	add(cmdStartup, "Start with Windows", startsWithWindows())
 	add(cmdFolder, "Open settings folder", false)
@@ -1016,6 +1054,32 @@ func showMenu(x, y int32) {
 }
 
 func runCommand(cmd int) {
+	switch {
+	case cmd >= cmdVoiceBase && cmd <= cmdVoiceBase+len(menuVoices):
+		i := cmd - cmdVoiceBase
+		if i == len(menuVoices) {
+			app.settings.VoiceName = ""
+			app.settings.VoiceEngine = "sapi"
+		} else {
+			app.settings.VoiceEngine = menuVoices[i].Engine
+			app.settings.VoiceName = menuVoices[i].Name
+		}
+		saveSettings(app.settings)
+		speaker.applyVoiceSettings()
+		w := speaker.windowsVoice()
+		speaker.stopOther(w)
+		w.speak("This voice will be used. "+app.settings.LiveText, false)
+		speaker.last = w
+		return
+	case cmd >= cmdRateBase && cmd < cmdRateBase+len(speedChoices):
+		app.settings.SpeechRate = speedChoices[cmd-cmdRateBase].rate
+		saveSettings(app.settings)
+		speaker.applyVoiceSettings()
+		w := speaker.windowsVoice()
+		w.speak(speedChoices[cmd-cmdRateBase].label+". "+app.settings.LiveText, false)
+		speaker.last = w
+		return
+	}
 	switch cmd {
 	case cmdStatus:
 		app.announce(app.last)
@@ -1041,6 +1105,17 @@ func runCommand(cmd int) {
 		} else {
 			say("Yeti Mute Talker will no longer start with Windows")
 		}
+	case cmdModeAuto, cmdModeWindows:
+		if cmd == cmdModeWindows {
+			app.settings.SpeechMode = modeWindows
+		} else {
+			app.settings.SpeechMode = modeAuto
+		}
+		saveSettings(app.settings)
+		say("Now speaking with " + speaker.outputName())
+	case cmdTestVoice:
+		speaker.windowsVoice().speak("This is the Windows voice. "+app.settings.LiveText, false)
+		speaker.last = speaker.windowsVoice()
 	case cmdFolder:
 		windows.ShellExecute(0, u16("open"), u16(dataDir), nil, nil, 1)
 	case cmdExit:
@@ -1049,9 +1124,7 @@ func runCommand(cmd int) {
 }
 
 func quit() {
-	if voice != nil {
-		oleutil.CallMethod(voice, "Speak", "Yeti Mute Talker closed", 2) // wait until spoken
-	}
+	speaker.sayAndWait("Yeti Mute Talker closed")
 	pDestroyWindow.Call(uintptr(hwnd))
 }
 
@@ -1126,7 +1199,7 @@ func main() {
 		saveSettings(app.settings) // write defaults so they can be edited
 	}
 	logf("%s %s starting", appName, appVersion)
-	initVoice(app.settings.SpeechRate)
+	speaker.init()
 
 	inst, _, _ := kernel32.NewProc("GetModuleHandleW").Call(0)
 	exe, _ := os.Executable()

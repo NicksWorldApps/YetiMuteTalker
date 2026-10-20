@@ -8,7 +8,7 @@ The Yeti shows its mute state only with a light on the mic, which is easy to mis
 
 ## Download
 
-Get **YetiMuteTalker-1.0-windows.zip** from the [Releases](../../releases) page. It contains a single program, **YetiMuteTalker.exe**. There is nothing to install.
+Get the latest **YetiMuteTalker-windows.zip** from the [Releases](../../releases) page. Unzip it and keep the files together: **YetiMuteTalker.exe** and **prism.dll**, which lets it speak through your screen reader. There is nothing to install.
 
 ## What it does
 
@@ -18,7 +18,8 @@ Get **YetiMuteTalker-1.0-windows.zip** from the [Releases](../../releases) page.
 - It works from any app, even while you're recording, streaming or gaming.
 - It tells you when the mic is unplugged or plugged back in.
 - Hotkeys let you check the mic any time without touching it.
-- It speaks with the built-in Windows voice, so it works alongside screen readers like NVDA, JAWS and Narrator.
+- If **NVDA** or **JAWS** is running, it speaks through your screen reader, in your own voice and speed, and shows the message on a braille display. Otherwise it uses a Windows voice.
+- You can pick any Windows voice installed on your computer, and its speed.
 - It has no window. It runs quietly in the notification area (system tray), with a menu that works from the keyboard.
 
 ## Who it's for
@@ -35,7 +36,7 @@ Other USB microphones with a hardware mute button may work too, because the prog
 ## Getting started
 
 1. Download the ZIP from [Releases](../../releases) and unzip it.
-2. Put **YetiMuteTalker.exe** somewhere permanent, such as your Documents folder.
+2. Put the **YetiMuteTalker** folder somewhere permanent, such as your Documents folder. Keep **prism.dll** next to **YetiMuteTalker.exe**.
 3. Run **YetiMuteTalker.exe**. Windows may warn that the program is unrecognized, because it isn't signed. Choose **More info**, then **Run anyway**.
 4. The first time it runs, a short spoken setup of about 10 seconds teaches the program what your mic sounds like:
    - Stay quiet while it listens.
@@ -54,12 +55,26 @@ These work from any app.
 | Ctrl + Alt + C | Run the setup again |
 | Ctrl + Alt + Shift + M | Close Yeti Mute Talker |
 
+## Screen readers and voices
+
+Yeti Mute Talker uses the [Prism](https://github.com/ethindp/prism) screen reader library:
+
+- When **NVDA** or **JAWS** is running, announcements go through your screen reader, and to your braille display if you use one.
+- When no screen reader is running, a **Windows voice** speaks instead.
+
+From the tray menu you can:
+
+- **Speak with:** choose **Always the Windows voice** if you'd rather the mic announcements sound different from your screen reader.
+- **Windows voice:** pick any installed voice. Voices marked "newer voice" are the more natural Windows 10 and 11 voices.
+- **Windows voice speed:** from Slow to Very fast.
+
 ## Tray menu
 
 Press **Windows + B** to move to the notification area, find Yeti Mute Talker with the arrow keys (it may be under "Show hidden icons"), and press **Enter**. The menu lets you:
 
 - hear the microphone status
 - hear the sound level
+- choose how it speaks, and which voice and speed
 - run the setup again
 - turn the beeps on or off
 - make it **start automatically with Windows**
@@ -84,7 +99,8 @@ The setup step measures your own mic and room, so the program knows where the li
 Settings are kept in `%APPDATA%\YetiMuteTalker\settings.ini`. Use **Open settings folder** in the tray menu to get there, and open the file in Notepad. You can change:
 
 - the words it says for muted and live
-- the speech speed
+- whether it speaks through your screen reader or a Windows voice
+- the Windows voice and its speed
 - whether it plays the beeps
 - how long the mic must be silent to count as muted
 - how long sound must last to count as live again
@@ -108,10 +124,14 @@ go mod tidy
 GOOS=windows GOARCH=amd64 go build -ldflags "-H windowsgui -s -w" -o YetiMuteTalker.exe .
 ```
 
+The program also needs **prism.dll** next to it at runtime. Get it from the `prism-windows-x64.zip` download of a [Prism release](https://github.com/ethindp/prism/releases) (`dynamic/release/bin/prism.dll`). Without it, the program still works, using a basic Windows voice.
+
 `rsrc_windows_amd64.syso` holds the program's icon and manifest. It was made from `icon.ico` and `app.manifest` with [rsrc](https://github.com/akavel/rsrc).
 
 ## License
 
 Released under the MIT License. See [LICENSE](LICENSE).
+
+Prism is by Ethin Probst and is licensed under the Mozilla Public License 2.0. The release download includes its license files.
 
 Yeti Mute Talker is an independent project. It is not made by, affiliated with, or endorsed by Logitech or Blue Microphones. "Blue Yeti" is a trademark of its owner.
