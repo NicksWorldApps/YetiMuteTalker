@@ -15,6 +15,7 @@ import (
 	"fmt"
 	"math"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"runtime"
 	"sort"
@@ -31,7 +32,7 @@ import (
 )
 
 const appName = "Yeti Mute Talker"
-const appVersion = "1.1.0"
+const appVersion = "1.2.1"
 
 // ---------------------------------------------------------------------------
 // Settings (stored in %APPDATA%\YetiMuteTalker\settings.ini)
@@ -60,7 +61,7 @@ func defaultSettings() Settings {
 		SpeechMode:  modeAuto,
 		VoiceEngine: "sapi",
 		Beeps:       true,
-		SilenceMs:   400,
+		SilenceMs:   1000,
 		LiveChunks:  3,
 		Threshold:   math.NaN(),
 	}
@@ -120,7 +121,8 @@ func loadSettings() Settings {
 		case "beeps":
 			s.Beeps = !(strings.EqualFold(v, "false") || v == "0" || strings.EqualFold(v, "off") || strings.EqualFold(v, "no"))
 		case "silence_ms":
-			if n, err := strconv.Atoi(v); err == nil && n >= 100 && n <= 5000 {
+			// Under 1 second is too jumpy: older versions used 400.
+			if n, err := strconv.Atoi(v); err == nil && n >= 1000 && n <= 5000 {
 				s.SilenceMs = n
 			}
 		case "live_chunks":
@@ -168,7 +170,9 @@ speech_rate=%d
 ; Play beeps before speaking: true or false
 beeps=%t
 
-; How long the mic must be completely silent to count as muted (milliseconds)
+; How long the mic must send the dead silence of the mute button before it
+; counts as muted (milliseconds, 1000 to 5000). Gaps where Windows sends no
+; sound at all, for example while a recording program has the mic, never count.
 silence_ms=%d
 
 ; How many 200 millisecond stretches in a row must have sound before the mic
@@ -198,9 +202,14 @@ func logf(format string, args ...interface{}) {
 // Microphone: listens to the mic and reports the loudest moment recently
 // ---------------------------------------------------------------------------
 
+// levelPoint is one packet of audio. real is false when Windows handed us a
+// packet with no actual sound data in it (for example while a recording
+// program has taken over the mic). Such packets prove nothing about the mute
+// button, so they never count as silence.
 type levelPoint struct {
-	t  time.Time
-	db float64
+	t    time.Time
+	db   float64
+	real bool
 }
 
 type Mic struct {
@@ -391,7 +400,8 @@ func (m *Mic) Update() bool {
 		}
 		n := int(frames) * m.blockAlign
 		peak := 0.0
-		if flags&wca.AUDCLNT_BUFFERFLAGS_SILENT == 0 && n > 0 && data != nil {
+		real := flags&wca.AUDCLNT_BUFFERFLAGS_SILENT == 0 && n > 0 && data != nil
+		if real {
 			buf := unsafe.Slice(data, n)
 			for i := 0; i+bytesPerSample <= n; i += bytesPerSample {
 				v := math.Abs(m.sample(buf, i))
@@ -406,12 +416,12 @@ func (m *Mic) Update() bool {
 			if peak > 0 {
 				db = math.Max(-150, 20*math.Log10(peak))
 			}
-			m.history = append(m.history, levelPoint{now, db})
+			m.history = append(m.history, levelPoint{now, db, real})
 		}
 	}
-	keepMs := m.windowMs
-	if keepMs < 2500 {
-		keepMs = 2500
+	keepMs := m.windowMs + 1000
+	if keepMs < 6000 {
+		keepMs = 6000
 	}
 	cutoff := now.Add(-time.Duration(keepMs) * time.Millisecond)
 	keep := 0
@@ -422,11 +432,38 @@ func (m *Mic) Update() bool {
 	recent := now.Add(-time.Duration(m.windowMs) * time.Millisecond)
 	loudest := -150.0
 	for _, p := range m.history {
-		if p.t.After(recent) && p.db > loudest {
+		if p.real && p.t.After(recent) && p.db > loudest {
 			loudest = p.db
 		}
 	}
 	m.Level = loudest
+	return true
+}
+
+// SilentEveryChunk reports whether each of the last n stretches of 200 ms
+// contained real audio from the mic, and all of it was below threshold.
+// A stretch with no real audio at all (the stream stalled, or another program
+// grabbed the mic) does NOT count as silent: we only call the mic muted when
+// it is actively sending us the dead silence of the mute button.
+func (m *Mic) SilentEveryChunk(threshold float64, n int) bool {
+	now := time.Now()
+	for c := 0; c < n; c++ {
+		end := now.Add(-time.Duration(c*200) * time.Millisecond)
+		start := end.Add(-200 * time.Millisecond)
+		gotReal := false
+		for _, p := range m.history {
+			if !p.t.After(start) || p.t.After(end) || !p.real {
+				continue
+			}
+			if p.db >= threshold {
+				return false
+			}
+			gotReal = true
+		}
+		if !gotReal {
+			return false
+		}
+	}
 	return true
 }
 
@@ -440,7 +477,7 @@ func (m *Mic) SoundInEveryChunk(threshold float64, n int) bool {
 		start := end.Add(-200 * time.Millisecond)
 		found := false
 		for _, p := range m.history {
-			if p.t.After(start) && !p.t.After(end) && p.db > threshold {
+			if p.real && p.t.After(start) && !p.t.After(end) && p.db > threshold {
 				found = true
 				break
 			}
@@ -495,6 +532,7 @@ type App struct {
 	setupLevels  []float64
 	firstLevel   float64
 	waitingVoice bool
+	unknownSince time.Time
 }
 
 var app App
@@ -509,6 +547,19 @@ func (a *App) stateText(s int) string {
 	return "Microphone not found"
 }
 
+// perfectSilence is the level below which sound counts as the mute button's
+// digital silence. Real room sound on a live Yeti stays well above it.
+const perfectSilence = -140.0
+
+// muteLine is the switch point actually used: the setup's value, but never
+// higher than perfectSilence.
+func muteLine(threshold float64) float64 {
+	if math.IsNaN(threshold) || threshold > perfectSilence {
+		return perfectSilence
+	}
+	return threshold
+}
+
 // rawState decides muted or live. Going from muted to live needs steady sound
 // (not just a bump or a touch); going from live to muted needs a short stretch
 // of complete silence.
@@ -516,8 +567,13 @@ func (a *App) rawState() int {
 	if a.mic.WindowsMute {
 		return stateMuted
 	}
-	silent := a.mic.Level < a.settings.Threshold
-	steady := a.mic.SoundInEveryChunk(a.settings.Threshold, a.settings.LiveChunks)
+	// A muted Yeti sends perfect digital silence (every sample exactly zero).
+	// A live Yeti in a very quiet room can dip to -100 dB or even lower, so
+	// only near-perfect silence counts as muted, never just a quiet room.
+	line := muteLine(a.settings.Threshold)
+	silentChunks := (a.settings.SilenceMs + 199) / 200
+	silent := a.mic.SilentEveryChunk(line, silentChunks)
+	steady := a.mic.SoundInEveryChunk(line, a.settings.LiveChunks)
 	switch a.last {
 	case stateMuted:
 		if steady {
@@ -530,11 +586,15 @@ func (a *App) rawState() int {
 		}
 		return stateLive
 	}
-	// Unknown (just started or reconnected): best guess right now
+	// Unknown (just started or reconnected): only decide once the mic has
+	// sent real audio, so a slow start can't be mistaken for muted.
 	if silent {
 		return stateMuted
 	}
-	return stateLive
+	if a.mic.Level >= line {
+		return stateLive
+	}
+	return stateUnknown
 }
 
 func (a *App) announce(s int) {
@@ -705,6 +765,18 @@ func (a *App) tick() {
 		return
 	}
 	raw := a.rawState()
+	if raw == stateUnknown {
+		// No real audio yet. Wait, but not forever: after 5 seconds of no
+		// sound data at all, a muted Yeti is the likely reason.
+		if a.unknownSince.IsZero() {
+			a.unknownSince = now
+		}
+		if now.Sub(a.unknownSince) < 5*time.Second {
+			return
+		}
+		raw = stateMuted
+	}
+	a.unknownSince = time.Time{}
 	switch {
 	case !a.started:
 		a.started = true
@@ -720,6 +792,11 @@ func (a *App) tick() {
 		say("Microphone connected. " + a.stateText(raw))
 		updateTip()
 	case raw != a.last:
+		why := "sound level " + strconv.FormatFloat(a.mic.Level, 'f', 1, 64) + " dB"
+		if a.mic.WindowsMute {
+			why = "muted in Windows sound settings"
+		}
+		logf("Now %s (%s)", map[int]string{stateMuted: "muted", stateLive: "live"}[raw], why)
 		a.last = raw
 		a.announce(raw)
 	}
@@ -732,7 +809,7 @@ func (a *App) sayLevel() {
 	}
 	msg := "Sound level " + levelWords(a.mic.Level) + "."
 	if !math.IsNaN(a.settings.Threshold) {
-		msg += " Switch point " + levelWords(a.settings.Threshold) + "."
+		msg += " Switch point " + levelWords(muteLine(a.settings.Threshold)) + "."
 	}
 	say(msg)
 }
@@ -780,6 +857,52 @@ func setStartsWithWindows(on bool) error {
 		return nil
 	}
 	return err
+}
+
+// ---------------------------------------------------------------------------
+// The old PowerShell version
+// ---------------------------------------------------------------------------
+
+// retireOldVersion stops the original PowerShell script (YetiMuteTalker.ps1)
+// if it is running, and stops it from starting with Windows. Two copies
+// listening at once means two sets of announcements, and the old script
+// switched to "muted" at the smallest gap in the sound.
+func retireOldVersion() {
+	appData, err := os.UserConfigDir()
+	if err == nil {
+		startup := filepath.Join(appData, `Microsoft\Windows\Start Menu\Programs\Startup`)
+		entries, _ := os.ReadDir(startup)
+		for _, e := range entries {
+			if e.IsDir() || !strings.HasSuffix(strings.ToLower(e.Name()), ".bat") {
+				continue
+			}
+			p := filepath.Join(startup, e.Name())
+			b, err := os.ReadFile(p)
+			if err != nil || !strings.Contains(strings.ToLower(string(b)), "yetimutetalker.ps1") {
+				continue
+			}
+			// Renamed, not deleted, so it can be put back by hand if wanted.
+			if err := os.Rename(p, p+".old-version-disabled"); err != nil {
+				logf("Could not turn off the old version's automatic start: %v", err)
+			} else {
+				logf("Turned off the old PowerShell version's automatic start (%s)", e.Name())
+			}
+		}
+	}
+
+	script := `$p = Get-CimInstance Win32_Process -Filter "Name='powershell.exe' OR Name='pwsh.exe'" | ` +
+		`Where-Object { $_.ProcessId -ne $PID -and $_.CommandLine -like '*YetiMuteTalker.ps1*' }; ` +
+		`foreach ($x in $p) { Stop-Process -Id $x.ProcessId -Force; Write-Output $x.ProcessId }`
+	cmd := exec.Command("powershell.exe", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", script)
+	cmd.SysProcAttr = &syscall.SysProcAttr{HideWindow: true, CreationFlags: 0x08000000} // CREATE_NO_WINDOW
+	out, err := cmd.Output()
+	if err != nil {
+		logf("Could not check for the old version: %v", err)
+		return
+	}
+	if ids := strings.Fields(string(out)); len(ids) > 0 {
+		logf("Closed the old PowerShell version that was also running (process %s)", strings.Join(ids, ", "))
+	}
 }
 
 // ---------------------------------------------------------------------------
@@ -1195,10 +1318,11 @@ func main() {
 
 	app.settings = loadSettings()
 	app.last = stateUnknown
-	if _, err := os.Stat(settingsPath()); err != nil {
-		saveSettings(app.settings) // write defaults so they can be edited
-	}
+	// Always rewrite: creates the file the first time, and brings older
+	// files up to date (new settings, and too-short silence_ms values fixed).
+	saveSettings(app.settings)
 	logf("%s %s starting", appName, appVersion)
+	go retireOldVersion()
 	speaker.init()
 
 	inst, _, _ := kernel32.NewProc("GetModuleHandleW").Call(0)

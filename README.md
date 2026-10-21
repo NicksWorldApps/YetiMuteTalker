@@ -87,7 +87,8 @@ Running YetiMuteTalker.exe again while it's already running doesn't start a seco
 
 The Yeti's mute button doesn't tell Windows anything, so Yeti Mute Talker listens to the microphone instead. A live mic always picks up a tiny bit of room sound, while a muted Yeti sends complete silence. The program watches for that difference.
 
-- When there has been complete silence for a short moment (0.4 seconds by default), the mic is muted.
+- When the mic has been sending the dead silence of the mute button for 1 second, the mic is muted.
+- Gaps where Windows delivers no sound at all — for example while a recording program has taken over the mic, or just after a recording ends — are ignored. They never count as muted, so the program won't announce a change you didn't make.
 - When steady sound comes through for about half a second, the mic is live again. A bump, a touch or moving the mic is too short to count, so it won't trick the program into saying live.
 
 The setup step measures your own mic and room, so the program knows where the line between muted and live falls.
@@ -113,6 +114,7 @@ Restart Yeti Mute Talker after editing.
 - **It says muted when the mic is live.** Make sure Windows lets desktop apps use the microphone: **Settings > Privacy & security > Microphone**.
 - **It misses button presses, or announces the wrong state.** Run the setup again with **Ctrl + Alt + C**, and stay as quiet as you can. Do the same if you turn the Yeti's gain knob a lot.
 - **A hotkey doesn't work.** Another program may already be using it.
+- **It announces mute or live by itself.** Make sure only one copy is running. Version 1.2 automatically closes the old PowerShell version (YetiMuteTalker.ps1) and turns off its automatic start. Every change is now written to the log with the sound level, which helps track down anything left.
 - **Something else is wrong.** Look in **YetiMuteTalker.log** in the settings folder, and include what it says when you open an issue.
 
 ## Building from source
